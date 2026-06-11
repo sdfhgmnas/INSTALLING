@@ -5,7 +5,7 @@ const toast = document.getElementById("toast");
 
 // App version — bump on every meaningful edit so deployed copies are
 // visibly identifiable.
-const APP_VERSION = "2.8.3";
+const APP_VERSION = "2.8.4";
 
 const USERS = {
   akash: { password: "akash", role: "akash" },
@@ -1477,7 +1477,10 @@ async function openBarcodeScannerModal({ title = "📷 Scan Barcode", hint = "Po
     ? `
       <div class="qr-reader-wrap">
         <div id="qrReader"></div>
-        <button type="button" class="qr-flip-btn" id="qrFlipBtn" aria-label="Flip camera">🔄</button>
+        <div class="qr-controls">
+          <button type="button" class="qr-icon-btn" id="qrTorchBtn" aria-label="Toggle torch / flashlight" style="display: none;">🔦</button>
+          <button type="button" class="qr-icon-btn" id="qrFlipBtn" aria-label="Flip camera">🔄</button>
+        </div>
         <div class="qr-status" id="qrStatus">Starting back camera…</div>
       </div>
       <div class="scan-divider"><span>OR</span></div>
@@ -1546,12 +1549,50 @@ async function openBarcodeScannerModal({ title = "📷 Scan Barcode", hint = "Po
   }
 
   // ----- Camera start logic with forced back-camera -----
+  // Wide qrbox optimised for Code 128 barcodes (IMEI / ICCID).
+  // These barcodes are long horizontal strips, so qrbox needs width.
+  const HQRFormats = window.Html5QrcodeSupportedFormats;
+  const allFormats = HQRFormats
+    ? [
+        HQRFormats.CODE_128,    // most common for IMEI / ICCID
+        HQRFormats.CODE_39,
+        HQRFormats.CODE_93,
+        HQRFormats.EAN_13,
+        HQRFormats.EAN_8,
+        HQRFormats.UPC_A,
+        HQRFormats.UPC_E,
+        HQRFormats.ITF,
+        HQRFormats.QR_CODE,
+        HQRFormats.DATA_MATRIX,
+        HQRFormats.PDF_417,
+      ]
+    : undefined;
+
   const config = {
-    fps: 12,
-    qrbox: { width: 260, height: 150 },
+    fps: 15,                                // higher framerate for snappier detection
+    qrbox: (vw, vh) => {
+      // For long Code 128 barcodes, we want a WIDE / SHORT scan box
+      const w = Math.min(vw * 0.92, 360);
+      const h = Math.min(vh * 0.45, 140);
+      return { width: Math.floor(w), height: Math.floor(h) };
+    },
     aspectRatio: 1.5,
     disableFlip: false,
     rememberLastUsedCamera: false,
+    formatsToSupport: allFormats,
+    experimentalFeatures: {
+      // Use the native BarcodeDetector API on supported devices for much
+      // better detection performance and accuracy.
+      useBarCodeDetectorIfSupported: true,
+    },
+    videoConstraints: {
+      // Request higher resolution for clearer barcode lines
+      facingMode: "environment",
+      width: { ideal: 1920, min: 640 },
+      height: { ideal: 1080, min: 480 },
+      focusMode: "continuous",
+      advanced: [{ focusMode: "continuous" }],
+    },
   };
 
   const startCamera = async (facing) => {
@@ -1562,7 +1603,7 @@ async function openBarcodeScannerModal({ title = "📷 Scan Barcode", hint = "Po
         try { await _activeScanner.clear(); } catch {}
         _activeScanner = null;
       }
-      _activeScanner = new HQR("qrReader", { verbose: false });
+      _activeScanner = new HQR("qrReader", { verbose: false, formatsToSupport: allFormats });
       await _activeScanner.start(
         { facingMode: facing },
         config,
@@ -1573,17 +1614,25 @@ async function openBarcodeScannerModal({ title = "📷 Scan Barcode", hint = "Po
         () => {} // per-frame decode misses
       );
       currentFacing = facing;
-      setStatus(`📷 ${facing === "environment" ? "Back" : "Front"} camera — hold steady`);
+      setStatus("📷 Hold steady, fill the bar in the frame");
+
+      // Show torch button if device supports it
+      try {
+        const settings = _activeScanner.getRunningTrackCameraCapabilities?.();
+        const torchBtn = document.getElementById("qrTorchBtn");
+        if (settings?.torchFeature?.()?.isSupported?.() && torchBtn) {
+          torchBtn.style.display = "flex";
+        }
+      } catch {}
     } catch (err) {
       console.warn("Camera start failed for", facing, err);
-      // If back camera fails, try by enumerating + picking by label
       if (facing === "environment") {
         try {
           const cams = await HQR.getCameras();
           const back = cams.find((c) => /back|rear|environment|world|wide(?!.*front)/i.test(c.label || ""));
           const fallbackId = back?.id || cams[cams.length - 1]?.id;
           if (fallbackId) {
-            _activeScanner = new HQR("qrReader", { verbose: false });
+            _activeScanner = new HQR("qrReader", { verbose: false, formatsToSupport: allFormats });
             await _activeScanner.start(
               fallbackId,
               config,
@@ -1593,7 +1642,7 @@ async function openBarcodeScannerModal({ title = "📷 Scan Barcode", hint = "Po
               },
               () => {}
             );
-            setStatus(`📷 Camera — hold steady`);
+            setStatus("📷 Hold steady, fill the bar in the frame");
             return;
           }
         } catch (innerErr) {
@@ -1610,6 +1659,23 @@ async function openBarcodeScannerModal({ title = "📷 Scan Barcode", hint = "Po
   document.getElementById("qrFlipBtn")?.addEventListener("click", () => {
     const newFacing = currentFacing === "environment" ? "user" : "environment";
     startCamera(newFacing);
+  });
+
+  // Torch / flashlight toggle (back camera with LED)
+  let torchOn = false;
+  document.getElementById("qrTorchBtn")?.addEventListener("click", async () => {
+    if (!_activeScanner) return;
+    try {
+      torchOn = !torchOn;
+      const cap = _activeScanner.getRunningTrackCameraCapabilities?.();
+      if (cap?.torchFeature) {
+        await cap.torchFeature().apply(torchOn);
+        const btn = document.getElementById("qrTorchBtn");
+        if (btn) btn.classList.toggle("active", torchOn);
+      }
+    } catch (err) {
+      console.warn("Torch toggle failed:", err);
+    }
   });
 }
 
